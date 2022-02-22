@@ -1,0 +1,264 @@
+---
+title: "BCB420H Assignment 1"
+author: "Terrence Amponsah"
+output:
+  html_document: default
+student_no: 1005413429
+---
+
+# 1. Finding a dataset:
+## R Setup: 
+
+```{r eval=FALSE}
+if (!requireNamespace(c("BiocManager", "GEOmetadb", "knitr", "edgeR"), quietly = TRUE)){
+  install.packages("BiocManager")
+  install.packages("GEOmetadb")
+  install.packages("knitr")
+  install.packages("edgeR")
+}
+
+
+
+library(DBI)
+library(GEOmetadb)
+library(GEOquery)
+library(knitr)
+library(edgeR)
+library("biomaRt")
+```
+]
+```{r}
+## This will install a 10+GB file onto the machine you're running this docker
+## contained on. make sure you have the space for it please :)
+# if(!file.exists("GEOmetadb.sqlite")) getSQLiteFile() 
+
+```
+
+## Database setup:
+```{r eval=FALSE}
+con <- dbConnect(SQLite(), "GEOmetadb.sqlite")
+```
+
+## Dataset choice: 
+For my dataset, I decided to choose something related to the liver. In the past, I have worked with other animal organisms and some plant and fungi data for analysis. Since I haven't done genome analysis with H. sapiens data, I decided to go with an arbitrary tissue to source from (liver)
+
+```{r eval=FALSE}
+
+sql <- paste("SELECT DISTINCT gse.title,gse.gse, gpl.title,",
+             " gse.submission_date,",
+             " gse.supplementary_file",
+             "FROM",
+             "  gse JOIN gse_gpl ON gse_gpl.gse=gse.gse",
+             "  JOIN gpl ON gse_gpl.gpl=gpl.gpl",
+             "WHERE",
+             "  gse.submission_date > '2019-02-01' AND",
+             "  gpl.organism LIKE '%Homo sapiens%' AND",
+             "  gpl.technology LIKE '%high-throughput seq%' AND",
+             "  gse.title LIKE '%hepat%'",
+             "  ORDER BY gse.submission_date ASC", sep=" ")
+
+result <- dbGetQuery (con, sql)
+
+knitr::kable(head(result), format="html")
+```
+
+For analysis, I chose the dataset [GSE126848](https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE126848)
+
+## Collect [GSE126848](https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE126848) data:
+```{r}
+
+suppFiles = GEOquery::getGEOSuppFiles('GSE126848')
+suppFiles # Only 1 supplemental file.
+fileNames = rownames(suppFiles)
+
+b2 = read.delim(fileNames[1], header=TRUE, check.names=FALSE)
+knitr::kable(head(b2))
+```
+
+## College GEO Description and other info: 
+```{r message=FALSE}
+gse <- GEOquery::getGEO("GSE126848", GSEMatrix = FALSE)
+knitr::kable(data.frame(head(GEOquery::Meta(gse))), format="html")
+current_gpl <-names(GEOquery::GPLList(gse))[1]
+current_gpl_info <-GEOquery::Meta(GEOquery::getGEO(current_gpl))
+```
+
+## Info about my dataset: 
+
+**Platform:** `r current_gpl_info$title`  
+**Submission date:** `r current_gpl_info$submission_date`  
+**Last update date:** `r current_gpl_info$last_update_date`   
+**Organism(s):** `r current_gpl_info$organism`   
+**\# Geo datasets which use this technology:** `r length(current_gpl_info$series_id)`   
+**\# Geo samples that use this technology:** `r length(current_gpl_info$sample_id)`
+
+*** 
+## Get expression data (again):
+```{r echo=TRUE}
+sfiles = GEOquery::getGEOSuppFiles("GSE126848")
+(fnames = rownames(sfiles))
+
+nafld_exp = read.delim(fnames[1], header=TRUE, check.names=FALSE)
+knitr::kable(nafld_exp[1:5,1:10], output="html")
+
+dim(nafld_exp)
+
+colnames(nafld_exp)
+```
+
+
+Now, I need to manually make a samples data.frame for use in normalization and to create a mapping between the column names provided in the GEO datset and the actual sample information. 
+```{r}
+patient_no <- as.character(c(1:15, 1:16, 1:14, 1:12))
+group <- rep(c("normal_weight", "NASH", "NAFL", "Obese"), times=c(15,16,14,12))
+ids <- c("0869", "0873", "0875", "0877", "0879", "0881", "0883", "0885", "0887",
+         "0889", "0891", "0893", "0897", "0910", "2684", "2688", "2692", "2696", 
+         "2698", "2704", "2705", "3992", "3994", "3996", "3997", "4000", "4004", 
+         "4005", "4006", "4008", "2683", "2685", "2687", "2689", "2691", "2693", 
+         "2697", "2701", "2703", "3993", "3995", "3998", "4002", "4007", "4010", 
+         "0872", "0874", "0876", "0878", "0886", "0888","0890", "0892", "0894", 
+         "0896", "0898", "0899")
+length(ids)
+samples <- data.frame(patient_no=patient_no, group=group, ids=ids)
+```
+
+The sample dataset from the GEO database does not have any HUGO identifiers, so we need to add this to the data: 
+## Adding HUGO:
+```{r}
+
+ensembl = biomaRt::useMart("ensembl", dataset = "hsapiens_gene_ensembl") # takes time
+gene <- biomaRt::getBM(attributes = c("ensembl_gene_id", "hgnc_symbol"), 
+              values = nafld_exp$key, mart=ensembl)
+id <- match(nafld_exp$key, gene$ensembl_gene_id)
+nafld_exp$HUGO_id <- gene$hgnc_symbol[id]
+knitr::kable(head(nafld_exp), output="html")
+```
+
+## Cleaning the data: 
+```{r}
+cpms = edgeR::cpm(nafld_exp[,2:58])
+
+# Using n = 12 (loosest i think). 
+# The publication has 4 n values (12, 14, 15, 16)
+# One for each category $\in$ {"obese", "NASH", "normal-weight", "NADL"}
+keep = rowSums(cpms > 1 ) >= 12
+filtered_ds = nafld_exp[keep,]
+dim(filtered_ds)
+dim(nafld_exp)
+
+summarized_gene_counts_filtered <- sort(table(filtered_ds$HUGO_id),
+                                        decreasing = TRUE)
+knitr::kable(summarized_gene_counts_filtered[which(summarized_gene_counts_filtered>1)],
+  format = "html")
+```
+
+# Visualizations of count data: (Post-cleaning, Pre-Normalization)
+
+## Boxplot:
+```{r warning=FALSE}
+data4plotting <- log2(edgeR::cpm(filtered_ds[,2:58]))
+boxplot(data4plotting, xlab = "Samples", ylab = "lob2 CPM", 
+        las = 2, cex = 0.5, cex.lab=0.5, 
+        cex.axis = 0.5, main="Liver Transcriptome signatures")
+abline(h = median(apply(data4plotting, 2, median)), col = "orange", lwd = 0.6, lty = "dashed")
+```
+
+## Density Plot:
+
+```{r}
+counts_density <- apply(log2(edgeR::cpm(filtered_ds[,2:58])), 2, density)
+
+xlim <- 0;
+ylim <- 0
+for (i in 1:length(counts_density)) {
+  xlim <- range(c(xlim, counts_density[[i]]$x));
+  ylim <- range(c(ylim, counts_density[[i]]$y))
+}
+
+cols <- rainbow(length(counts_density))
+ltys <- rep(1, length(counts_density))
+
+#plot the first density plot to initialize the plot
+plot(counts_density[[1]], xlim=xlim, ylim=ylim, type="n", ylab="Density of log2-CountsPerMill", 
+     main=" ", cex.lab=0.85)
+
+for (i in 1:length(counts_density)) lines(counts_density[[i]], col=cols[i], lty=ltys[i])
+    #create legend
+legend( "right" ,colnames(data4plotting), col=cols, lty=ltys, cex=0.75, border ="blue",  text.col = "green4", merge = TRUE, bg = "gray90")
+```
+
+## MA Plot of Example NAFL vs Normal-weight:
+```{r}
+limma::plotMA(log2(nafld_exp[,c(2,28)]), ylab="M - ratio log expression", main="NAFL vs Normal-Weight'ed human sample comparison")
+```
+
+***
+
+# Normalization: 
+## Normalization by TMM: 
+
+```{r}
+filtered_ds_mtx <- as.matrix(filtered_ds[,2:58])
+rownames(filtered_ds_mtx) <- filtered_ds[,59] #proper names this time around.
+
+dge <- edgeR::DGEList(counts = filtered_ds_mtx, group=samples$group)
+
+norm_fact <- edgeR::calcNormFactors(dge)
+normalized_counts <- edgeR::cpm(norm_fact)
+knitr::kable(head(normalized_counts), output="html")
+```
+
+## Density plot of normalized: 
+```{r}
+norm_dcount <- apply(log2(normalized_counts), 2, density)
+
+xlim <- 0
+ylim <- 0
+for (i in 1:length(norm_dcount)) {
+  xlim <- range(c(xlim, norm_dcount[[i]]$x));
+  ylim <- range(c(ylim, norm_dcount[[i]]$y))
+}
+
+cols <- rainbow(length(norm_dcount))
+ltys <- rep(1, length(norm_dcount))
+
+#plot the first density plot to initialize the plot
+plot(norm_dcount[[1]], xlim=xlim, ylim=ylim, type="n", ylab="Density of log2-CountsPerMill", 
+     main=" ", cex.lab=0.85)
+
+for (i in 1:length(norm_dcount)) lines(norm_dcount[[i]], col=cols[i], lty=ltys[i])
+    #create legend
+legend( "right" ,colnames(data4plotting), col=cols, lty=ltys, cex=0.75, border ="blue",  text.col = "green4", merge = TRUE, bg = "gray90")
+```
+
+## (original density plot, for reference:)
+```{r echo = FALSE} 
+counts_density <- apply(log2(edgeR::cpm(filtered_ds[,2:58])), 2, density)
+
+xlim <- 0;
+ylim <- 0
+for (i in 1:length(counts_density)) {
+  xlim <- range(c(xlim, counts_density[[i]]$x));
+  ylim <- range(c(ylim, counts_density[[i]]$y))
+}
+
+cols <- rainbow(length(counts_density))
+ltys <- rep(1, length(counts_density))
+
+#plot the first density plot to initialize the plot
+plot(counts_density[[1]], xlim=xlim, ylim=ylim, type="n", ylab="Density of log2-CountsPerMill", 
+     main=" ", cex.lab=0.85)
+
+for (i in 1:length(counts_density)) lines(counts_density[[i]], col=cols[i], lty=ltys[i])
+    #create legend
+legend( "right" ,colnames(data4plotting), col=cols, lty=ltys, cex=0.75, border ="blue",  text.col = "green4", merge = TRUE, bg = "gray90")
+```
+
+## Interpretation and Documentation: 
+* The control conditions were the Healthy and Obese conditions that were tested. The "test" conditions are the Non-Alcoholic Fatty Liver Disease and the non-alcoholic steatohepatitis (NASH) conditions.
+* This dataset is of interest to me because the liver is very widely studied and this dataset fits with the specifications for the assignment. This dataset from liver tissue of different patients. Previously I have done analysis on plant and fungi however, I have not done much analysis on H. sapiens data, so I wanted to choose a dataset with a good amount of data, which also seems interesting and links and has links to nutrition, something that concerns every human.
+* PINX1 and SIGLEC5 are the only gene id's that were not unique, these values were left in the data. 
+* Yes, there were some Ensembl ids which did not have a corresponding HUGO symbol, however those usually mapped to values with very low cpms which were removed in the cleaning step.
+* There were no outliers which were removed manually.
+* Replicates (if any) were filtered out.
+* Final Coverage of dataset: `r round((nrow(normalized_counts) / nrow(nafld_exp) * 100), digits=2)`%
